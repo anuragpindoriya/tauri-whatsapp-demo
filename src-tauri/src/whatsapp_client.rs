@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tauri::{Emitter, State, Window, Manager};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc, oneshot};
 use whatsapp_rust::bot::Bot;
 use whatsapp_rust::store::SqliteStore;
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
@@ -13,16 +13,35 @@ use whatsapp_rust::Jid;
 use whatsapp_rust::waproto::whatsapp as wa;
 use whatsapp_rust::download::MediaType;
 
+// Commands sent to the bot task to avoid cross-thread Rc issues
+enum BotCommand {
+    SendMessage {
+        jid: Jid,
+        message: wa::Message,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    SendMediaMessage {
+        jid: Jid,
+        media_data: Vec<u8>,
+        media_type_enum: MediaType,
+        media_category: String,
+        mime_type: String,
+        caption: String,
+        file_name: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+}
+
 pub struct WhatsAppState {
-    bot: Arc<Mutex<Option<Bot>>>,
+    command_tx: Arc<Mutex<Option<mpsc::Sender<BotCommand>>>>,
     is_authenticated: Arc<Mutex<bool>>,
-    is_ready: Arc<Mutex<bool>>, // New: Track if bot is fully ready
+    is_ready: Arc<Mutex<bool>>,
 }
 
 impl WhatsAppState {
     pub fn new() -> Self {
         Self {
-            bot: Arc::new(Mutex::new(None)),
+            command_tx: Arc::new(Mutex::new(None)),
             is_authenticated: Arc::new(Mutex::new(false)),
             is_ready: Arc::new(Mutex::new(false)),
         }
@@ -61,35 +80,37 @@ pub async fn init_whatsapp(
         .await
         .map_err(|e| e.to_string())?;
 
+    let (tx, mut rx) = mpsc::channel::<BotCommand>(32);
+    *state.command_tx.lock().await = Some(tx);
+
     let window_clone = window.clone();
     let state_clone = state.inner().clone();
-    let state_for_bot = state.inner().clone(); // Clone again for bot storage
     
     tokio::spawn(async move {
+        let state_for_events = state_clone.clone();
+        let window_for_logout = window_clone.clone();
+        
         let bot_result = Bot::builder()
             .with_backend(Arc::new(backend))
             .with_transport_factory(TokioWebSocketTransportFactory::new())
             .with_http_client(UreqHttpClient::new())
             .on_event(move |event, _client| {
                 let window = window_clone.clone();
-                let state = state_clone.clone();
+                let state = state_for_events.clone();
                 
                 async move {
                     match event {
-                        // Emit QR Code to frontend
                         Event::PairingQrCode { code, .. } => {
                             println!("QR Code generated");
                             let _ = window.emit("qr-code", QrCodeEvent { code });
                         }
                         
-                        // Authentication successful
                         Event::PairSuccess(_) => {
                             println!("Pair success event received");
                             *state.is_authenticated.lock().await = true;
                             let _ = window.emit("auth-success", ());
                         }
                         
-                        // Authentication connected - Bot is fully ready
                         Event::Connected(_) => {
                             println!("Connected event received - Bot is fully ready");
                             *state.is_authenticated.lock().await = true;
@@ -97,20 +118,18 @@ pub async fn init_whatsapp(
                             let _ = window.emit("auth-success", ());
                         }
                         
-                        // Log other events for debugging
                         Event::LoggedOut(_) => {
                             println!("Logged out event received");
                             *state.is_authenticated.lock().await = false;
                             *state.is_ready.lock().await = false;
+                            let _ = window.emit("logged-out", ());
                         }
                         
                         Event::Message(_msg, info) => {
                             println!("Message received from: {:?}", info.source.sender);
                         }
                         
-                        _ => {
-                            // println!("Other event received: {:?}", event);
-                        }
+                        _ => {}
                     }
                 }
             })
@@ -120,13 +139,120 @@ pub async fn init_whatsapp(
         match bot_result {
             Ok(mut bot) => {
                 println!("Bot built successfully, starting...");
-                // Start the bot
                 match bot.run().await {
                     Ok(handle) => {
                         println!("Bot started successfully");
-                        *state_for_bot.bot.lock().await = Some(bot);
-                        // Keep the task alive
-                        let _ = handle.await;
+                        let client = bot.client();
+                        
+                        // Process commands via channel on the SAME task as the bot.
+                        // This avoids cross-thread Rc access that causes crashes.
+                        tokio::pin!(handle);
+                        loop {
+                            tokio::select! {
+                                cmd = rx.recv() => {
+                                    match cmd {
+                                        Some(BotCommand::SendMessage { jid, message, reply }) => {
+                                            println!("Processing SendMessage command");
+                                            let result = client.send_message(jid, message).await
+                                                .map_err(|e| format!("Failed to send: {}", e));
+                                            let _ = reply.send(result);
+                                        }
+                                        Some(BotCommand::SendMediaMessage {
+                                            jid, media_data, media_type_enum,
+                                            media_category, mime_type, caption,
+                                            file_name, reply
+                                        }) => {
+                                            println!("Processing SendMediaMessage command");
+                                            let result = async {
+                                                println!("Uploading media...");
+                                                let uploaded = client.upload(media_data, media_type_enum)
+                                                    .await.map_err(|e| {
+                                                        eprintln!("Upload failed: {}", e);
+                                                        e.to_string()
+                                                    })?;
+                                                println!("Media uploaded successfully");
+                                                
+                                                let wa_message = match media_category.as_str() {
+                                                    "image" => {
+                                                        let mut img_msg = wa::message::ImageMessage {
+                                                            url: Some(uploaded.url),
+                                                            direct_path: Some(uploaded.direct_path),
+                                                            media_key: Some(uploaded.media_key.to_vec()),
+                                                            file_enc_sha256: Some(uploaded.file_enc_sha256.to_vec()),
+                                                            file_sha256: Some(uploaded.file_sha256.to_vec()),
+                                                            file_length: Some(uploaded.file_length),
+                                                            mimetype: Some(mime_type),
+                                                            ..Default::default()
+                                                        };
+                                                        if !caption.is_empty() {
+                                                            img_msg.caption = Some(caption);
+                                                        }
+                                                        wa::Message {
+                                                            image_message: Some(Box::new(img_msg)),
+                                                            ..Default::default()
+                                                        }
+                                                    },
+                                                    "video" => {
+                                                        let mut vid_msg = wa::message::VideoMessage {
+                                                            url: Some(uploaded.url),
+                                                            direct_path: Some(uploaded.direct_path),
+                                                            media_key: Some(uploaded.media_key.to_vec()),
+                                                            file_enc_sha256: Some(uploaded.file_enc_sha256.to_vec()),
+                                                            file_sha256: Some(uploaded.file_sha256.to_vec()),
+                                                            file_length: Some(uploaded.file_length),
+                                                            mimetype: Some(mime_type),
+                                                            ..Default::default()
+                                                        };
+                                                        if !caption.is_empty() {
+                                                            vid_msg.caption = Some(caption);
+                                                        }
+                                                        wa::Message {
+                                                            video_message: Some(Box::new(vid_msg)),
+                                                            ..Default::default()
+                                                        }
+                                                    },
+                                                    _ => {
+                                                        let doc_msg = wa::message::DocumentMessage {
+                                                            url: Some(uploaded.url),
+                                                            direct_path: Some(uploaded.direct_path),
+                                                            media_key: Some(uploaded.media_key.to_vec()),
+                                                            file_enc_sha256: Some(uploaded.file_enc_sha256.to_vec()),
+                                                            file_sha256: Some(uploaded.file_sha256.to_vec()),
+                                                            file_length: Some(uploaded.file_length),
+                                                            mimetype: Some(mime_type),
+                                                            file_name: Some(file_name),
+                                                            ..Default::default()
+                                                        };
+                                                        wa::Message {
+                                                            document_message: Some(Box::new(doc_msg)),
+                                                            ..Default::default()
+                                                        }
+                                                    },
+                                                };
+                                                
+                                                client.send_message(jid, wa_message).await
+                                                    .map_err(|e| format!("Failed to send media: {}", e))
+                                            }.await;
+                                            let _ = reply.send(result);
+                                        }
+                                        None => {
+                                            println!("Command channel closed");
+                                            break;
+                                        }
+                                    }
+                                }
+                                _ = &mut handle => {
+                                    println!("Bot handle completed");
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Bot stopped - reset state
+                        println!("Bot task ending, resetting state");
+                        *state_clone.is_ready.lock().await = false;
+                        *state_clone.is_authenticated.lock().await = false;
+                        let _ = window_for_logout.emit("logged-out", ());
                     }
                     Err(e) => {
                         eprintln!("Failed to run bot: {}", e);
@@ -137,8 +263,6 @@ pub async fn init_whatsapp(
                 eprintln!("Failed to build bot: {}", e);
             }
         }
-        
-        Ok::<_, String>(())
     });
 
     Ok(())
@@ -160,27 +284,17 @@ pub async fn send_message(
     message: String,
     state: State<'_, Arc<WhatsAppState>>,
 ) -> Result<String, String> {
-    // Check if bot is ready
     let is_ready = *state.is_ready.lock().await;
     if !is_ready {
         return Err("WhatsApp is not ready yet. Please wait for connection to complete.".to_string());
     }
 
-    // Get client reference and release the bot lock immediately
-    let client = {
-        let bot_guard = state.bot.lock().await;
-        let bot = bot_guard.as_ref().ok_or("WhatsApp not initialized")?;
-        bot.client()
-    };
-    
-    // Parse contact to JID format (remove any + or spaces)
     let clean_contact = contact.replace(['+', ' ', '-'], "");
     println!("Sending message to contact: {}", clean_contact);
     
     let jid = Jid::new(&clean_contact, "s.whatsapp.net");
     println!("Parsed JID: {}", jid);
     
-    // Build text message using ExtendedTextMessage for better compatibility
     let wa_message = wa::Message {
         extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
             text: Some(message.clone()),
@@ -191,15 +305,30 @@ pub async fn send_message(
 
     println!("Attempting to send message: {}", message);
     
-    match client.send_message(jid, wa_message).await {
-        Ok(msg_id) => {
+    // Send command to bot task via channel (avoids cross-thread Rc crash)
+    let (reply_tx, reply_rx) = oneshot::channel();
+    
+    let tx = {
+        let guard = state.command_tx.lock().await;
+        guard.as_ref().ok_or("WhatsApp not initialized")?.clone()
+    };
+    
+    tx.send(BotCommand::SendMessage {
+        jid,
+        message: wa_message,
+        reply: reply_tx,
+    }).await.map_err(|_| "Failed to send command to bot task".to_string())?;
+    
+    match reply_rx.await {
+        Ok(Ok(msg_id)) => {
             println!("Message sent successfully with ID: {}", msg_id);
             Ok(msg_id)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Failed to send message: {}", e);
-            Err(format!("Failed to send message: {}", e))
+            Err(e)
         }
+        Err(_) => Err("Bot task dropped before responding".to_string()),
     }
 }
 
@@ -212,118 +341,56 @@ pub async fn send_media_message(
     media_type: String, // "image", "video", "document"
     state: State<'_, Arc<WhatsAppState>>,
 ) -> Result<String, String> {
-    // Check if bot is ready
     let is_ready = *state.is_ready.lock().await;
     if !is_ready {
         return Err("WhatsApp is not ready yet. Please wait for connection to complete.".to_string());
     }
 
-    // Get client reference and release the bot lock immediately
-    let client = {
-        let bot_guard = state.bot.lock().await;
-        let bot = bot_guard.as_ref().ok_or("WhatsApp not initialized")?;
-        bot.client()
-    };
-    
-    // Parse contact to JID format
     let clean_contact = contact.replace(['+', ' ', '-'], "");
     let jid = Jid::new(&clean_contact, "s.whatsapp.net");
     
     println!("Sending {} to: {}", media_type, clean_contact);
     
-    // Read media file
     let media_data = std::fs::read(&media_path).map_err(|e| e.to_string())?;
     println!("Read media file: {} bytes", media_data.len());
     
-    // Determine media type and MIME type
     let (media_type_enum, mime_type) = get_media_type_and_mime(&media_type, &media_path);
     
-    // Upload media using the correct API
-    println!("Uploading media...");
-    let uploaded = client
-        .upload(media_data, media_type_enum)
-        .await
-        .map_err(|e| {
-            eprintln!("Upload failed: {}", e);
-            e.to_string()
-        })?;
+    let file_name = std::path::Path::new(&media_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("document")
+        .to_string();
     
-    println!("Media uploaded successfully");
+    // Send command to bot task via channel (avoids cross-thread Rc crash)
+    let (reply_tx, reply_rx) = oneshot::channel();
     
-    // Build message with media based on type
-    let wa_message = match media_type.as_str() {
-        "image" => {
-            let mut img_msg = wa::message::ImageMessage {
-                url: Some(uploaded.url),
-                direct_path: Some(uploaded.direct_path),
-                media_key: Some(uploaded.media_key.to_vec()),
-                file_enc_sha256: Some(uploaded.file_enc_sha256.to_vec()),
-                file_sha256: Some(uploaded.file_sha256.to_vec()),
-                file_length: Some(uploaded.file_length),
-                mimetype: Some(mime_type),
-                ..Default::default()
-            };
-            if !message_text.is_empty() {
-                img_msg.caption = Some(message_text);
-            }
-            wa::Message {
-                image_message: Some(Box::new(img_msg)),
-                ..Default::default()
-            }
-        },
-        "video" => {
-            let mut vid_msg = wa::message::VideoMessage {
-                url: Some(uploaded.url),
-                direct_path: Some(uploaded.direct_path),
-                media_key: Some(uploaded.media_key.to_vec()),
-                file_enc_sha256: Some(uploaded.file_enc_sha256.to_vec()),
-                file_sha256: Some(uploaded.file_sha256.to_vec()),
-                file_length: Some(uploaded.file_length),
-                mimetype: Some(mime_type),
-                ..Default::default()
-            };
-            if !message_text.is_empty() {
-                vid_msg.caption = Some(message_text);
-            }
-            wa::Message {
-                video_message: Some(Box::new(vid_msg)),
-                ..Default::default()
-            }
-        },
-        "document" | _ => {
-            let doc_msg = wa::message::DocumentMessage {
-                url: Some(uploaded.url),
-                direct_path: Some(uploaded.direct_path),
-                media_key: Some(uploaded.media_key.to_vec()),
-                file_enc_sha256: Some(uploaded.file_enc_sha256.to_vec()),
-                file_sha256: Some(uploaded.file_sha256.to_vec()),
-                file_length: Some(uploaded.file_length),
-                mimetype: Some(mime_type),
-                file_name: Some(
-                    std::path::Path::new(&media_path)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("document")
-                        .to_string()
-                ),
-                ..Default::default()
-            };
-            wa::Message {
-                document_message: Some(Box::new(doc_msg)),
-                ..Default::default()
-            }
-        },
+    let tx = {
+        let guard = state.command_tx.lock().await;
+        guard.as_ref().ok_or("WhatsApp not initialized")?.clone()
     };
     
-    match client.send_message(jid, wa_message).await {
-        Ok(msg_id) => {
+    tx.send(BotCommand::SendMediaMessage {
+        jid,
+        media_data,
+        media_type_enum,
+        media_category: media_type,
+        mime_type,
+        caption: message_text,
+        file_name,
+        reply: reply_tx,
+    }).await.map_err(|_| "Failed to send command to bot task".to_string())?;
+    
+    match reply_rx.await {
+        Ok(Ok(msg_id)) => {
             println!("Media message sent successfully with ID: {}", msg_id);
             Ok(msg_id)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("Failed to send media message: {}", e);
-            Err(format!("Failed to send media message: {}", e))
+            Err(e)
         }
+        Err(_) => Err("Bot task dropped before responding".to_string()),
     }
 }
 

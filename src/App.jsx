@@ -17,11 +17,11 @@ function App() {
   const [isReady, setIsReady] = useState(false);
 
   useEffect(() => {
-    // Initialize WhatsApp connection
-    initializeWhatsApp();
+    let pollInterval = null;
 
-    // Listen for QR code events
-    const setupListeners = async () => {
+    const setup = async () => {
+      // Set up listeners FIRST before initializing WhatsApp
+      // (prevents missing auth-success on reconnection from saved session)
       const qrUnlisten = await listen('qr-code', (event) => {
         console.log('QR Code received:', event.payload);
         setQrCode(event.payload.code);
@@ -31,44 +31,74 @@ function App() {
       const authUnlisten = await listen('auth-success', async () => {
         console.log('Authentication successful!');
         
-        // Wait a bit for full connection
         setTimeout(async () => {
-          const ready = await invoke('is_bot_ready');
-          setIsReady(ready);
-          if (ready) {
-            setScreen('message');
-            setSuccess('WhatsApp connected and ready!');
-            setTimeout(() => setSuccess(''), 3000);
+          try {
+            const ready = await invoke('is_bot_ready');
+            setIsReady(ready);
+            if (ready) {
+              setScreen('message');
+              setSuccess('WhatsApp connected and ready!');
+              setTimeout(() => setSuccess(''), 3000);
+              if (pollInterval) {
+                clearInterval(pollInterval);
+                pollInterval = null;
+              }
+            }
+          } catch (e) {
+            console.error('Error checking bot ready:', e);
           }
         }, 2000);
       });
 
-      // Return cleanup function
+      const logoutUnlisten = await listen('logged-out', () => {
+        console.log('Logged out - switching to QR screen');
+        setIsReady(false);
+        setScreen('qr');
+        setQrCode('');
+        setError('Session expired. Please scan QR code again.');
+      });
+
+      // NOW initialize WhatsApp (listeners are ready to catch events)
+      try {
+        setLoading(true);
+        await invoke('init_whatsapp');
+        console.log('WhatsApp initialization started');
+      } catch (err) {
+        console.error('Failed to initialize WhatsApp:', err);
+        setError(`Failed to initialize: ${err}`);
+      } finally {
+        setLoading(false);
+      }
+
+      // Poll for ready state to catch reconnections from saved sessions
+      pollInterval = setInterval(async () => {
+        try {
+          const ready = await invoke('is_bot_ready');
+          if (ready) {
+            setIsReady(true);
+            setScreen('message');
+            clearInterval(pollInterval);
+            pollInterval = null;
+          }
+        } catch (e) {
+          // Ignore polling errors
+        }
+      }, 2000);
+
       return () => {
         qrUnlisten();
         authUnlisten();
+        logoutUnlisten();
+        if (pollInterval) clearInterval(pollInterval);
       };
     };
 
-    const cleanup = setupListeners();
+    const cleanup = setup();
 
     return () => {
       cleanup.then((fn) => fn && fn());
     };
   }, []);
-
-  const initializeWhatsApp = async () => {
-    try {
-      setLoading(true);
-      await invoke('init_whatsapp');
-      console.log('WhatsApp initialization started');
-    } catch (err) {
-      console.error('Failed to initialize WhatsApp:', err);
-      setError(`Failed to initialize: ${err}`);
-    } finally {
-      setLoading(false);
-    }
-  };
 
   const handleSendMessage = async () => {
     if (!contact.trim()) {
