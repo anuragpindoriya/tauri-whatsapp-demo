@@ -166,8 +166,12 @@ pub async fn send_message(
         return Err("WhatsApp is not ready yet. Please wait for connection to complete.".to_string());
     }
 
-    let bot_guard = state.bot.lock().await;
-    let bot = bot_guard.as_ref().ok_or("WhatsApp not initialized")?;
+    // Get client reference and release the bot lock immediately
+    let client = {
+        let bot_guard = state.bot.lock().await;
+        let bot = bot_guard.as_ref().ok_or("WhatsApp not initialized")?;
+        bot.client()
+    };
     
     // Parse contact to JID format (remove any + or spaces)
     let clean_contact = contact.replace(['+', ' ', '-'], "");
@@ -176,15 +180,18 @@ pub async fn send_message(
     let jid = Jid::new(&clean_contact, "s.whatsapp.net");
     println!("Parsed JID: {}", jid);
     
-    // Build text message
+    // Build text message using ExtendedTextMessage for better compatibility
     let wa_message = wa::Message {
-        conversation: Some(message.clone()),
+        extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+            text: Some(message.clone()),
+            ..Default::default()
+        })),
         ..Default::default()
     };
 
     println!("Attempting to send message: {}", message);
     
-    match bot.client().send_message(jid, wa_message).await {
+    match client.send_message(jid, wa_message).await {
         Ok(msg_id) => {
             println!("Message sent successfully with ID: {}", msg_id);
             Ok(msg_id)
@@ -211,8 +218,12 @@ pub async fn send_media_message(
         return Err("WhatsApp is not ready yet. Please wait for connection to complete.".to_string());
     }
 
-    let bot_guard = state.bot.lock().await;
-    let bot = bot_guard.as_ref().ok_or("WhatsApp not initialized")?;
+    // Get client reference and release the bot lock immediately
+    let client = {
+        let bot_guard = state.bot.lock().await;
+        let bot = bot_guard.as_ref().ok_or("WhatsApp not initialized")?;
+        bot.client()
+    };
     
     // Parse contact to JID format
     let clean_contact = contact.replace(['+', ' ', '-'], "");
@@ -229,7 +240,7 @@ pub async fn send_media_message(
     
     // Upload media using the correct API
     println!("Uploading media...");
-    let uploaded = bot.client()
+    let uploaded = client
         .upload(media_data, media_type_enum)
         .await
         .map_err(|e| {
@@ -304,7 +315,7 @@ pub async fn send_media_message(
         },
     };
     
-    match bot.client().send_message(jid, wa_message).await {
+    match client.send_message(jid, wa_message).await {
         Ok(msg_id) => {
             println!("Media message sent successfully with ID: {}", msg_id);
             Ok(msg_id)

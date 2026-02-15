@@ -11,6 +11,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(whatsapp_state)
         .invoke_handler(tauri::generate_handler![
             whatsapp_client::init_whatsapp,
